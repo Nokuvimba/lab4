@@ -1,79 +1,201 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, Response
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-
+from sqlalchemy.orm import selectinload
 from .database import engine, SessionLocal
-from .models import Base, UserDB
-from .schemas import UserCreate, UserRead
+from .models import Base, UserDB, CourseDB, ProjectDB
+from .schemas import (
+    UserCreate, UserRead, UserUpdatePUT, UserUpdatePATCH,
+    CourseCreate, CourseRead,
+    ProjectCreate, ProjectRead, ProjectUpdatePUT, ProjectUpdatePATCH,
+    ProjectReadWithOwner, ProjectCreateForUser
+)
 
 app = FastAPI()
 Base.metadata.create_all(bind=engine)
 
-# Dependency to get DB session
 def get_db():
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
-        
-# Health check endpoint
-@app.get("/health") 
-def health_check():
-    return {"status": "ok"}
 
-# List users
-@app.get("/api/users", response_model=list[UserRead])
-def list_users(db: Session = Depends(get_db)):
-    stmt = select(UserDB).order_by(UserDB.id) # Order by user ID
-    return list(db.execute(stmt).scalars())
-
-# Get user by ID
-@app.get("/api/users/{user_id}", response_model=UserRead)
-def get_user(user_id: int, db: Session = Depends(get_db)):
-    # Fetch user by ID
-    user = db.get(UserDB, user_id)
-    if not user: # Handle user not found
-        raise HTTPException(status_code=404, detail="User not found")
-    return user
-
-# create user
-@app.post("/api/users", response_model=UserRead, status_code=status.HTTP_201_CREATED)
-def add_user(payload: UserCreate, db: Session = Depends(get_db)): # Create new user
-    user = UserDB(**payload.model_dump()) #
-    db.add(user)
+def commit_or_rollback(db: Session, error_msg: str):
     try:
         db.commit()
-        db.refresh(user)
-    except IntegrityError: # Handle duplicate user error
+    except IntegrityError:
         db.rollback()
-        raise HTTPException(status_code=409, detail="User already exists")
-    return user
+        raise HTTPException(status_code=409, detail=error_msg)
 
-#update users 
-@app.put("/api/users/{user_id}", response_model=UserRead)
-def update_user(user_id: int, payload: UserCreate, db: Session = Depends(get_db)): # Update existing user
-    user = db.get(UserDB, user_id) # Fetch user by ID
-    if not user: 
-        raise HTTPException(status_code=404, detail="User not found")
-    # Updating user fields that are provided in the payload through a loop
-    for key, value in payload.model_dump().items(): 
-        setattr(user, key, value) 
-    try: # Save changes
-        db.commit()
-        db.refresh(user)
-    except IntegrityError: 
-        db.rollback()
-        raise HTTPException(status_code=409, detail="User already exists") 
-    return user
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
-#delete users
-@app.delete("/api/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_user(user_id: int, db: Session = Depends(get_db)): # Delete user
-    user = db.get(UserDB, user_id) # Fetch user by ID
+#Courses
+@app.post("/api/courses", response_model=CourseRead, status_code=201, summary="You could add details")
+def create_course(course: CourseCreate, db: Session = Depends(get_db)):
+    db_course = CourseDB(**course.model_dump())
+    db.add(db_course)
+    commit_or_rollback(db, "Course already exists")
+    db.refresh(db_course)
+    return db_course
+
+@app.get("/api/courses", response_model=list[CourseRead])
+def list_courses(limit: int = 10, offset: int = 0, db: Session = Depends(get_db)):
+    stmt = select(CourseDB).order_by(CourseDB.id).limit(limit).offset(offset)
+    return db.execute(stmt).scalars().all()
+
+#Projects
+@app.post("/api/projects", response_model=ProjectRead, status_code=201)
+def create_project(project: ProjectCreate, db: Session = Depends(get_db)):
+    user = db.get(UserDB, project.owner_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    db.delete(user) # Delete user
+    
+    proj = ProjectDB(
+        name=project.name,
+        description=project.description,
+        owner_id=project.owner_id,
+    )
+    db.add(proj)
+    commit_or_rollback(db, "Project creation failed")
+    db.refresh(proj)
+    return proj
+
+@app.get("/api/projects", response_model=list[ProjectRead])
+def list_projects(db: Session = Depends(get_db)):
+    stmt = select(ProjectDB).order_by(ProjectDB.id)
+    return db.execute(stmt).scalars().all()
+
+@app.get("/api/projects/{project_id}", response_model=ProjectReadWithOwner)
+def get_project_with_owner(project_id: int, db: Session = Depends(get_db)):
+    stmt = select(ProjectDB).where(ProjectDB.id == project_id).options(selectinload(ProjectDB.owner))
+    proj = db.execute(stmt).scalar_one_or_none()
+    if not proj:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return proj
+
+# --- Projects: PUT (full replace) ---
+@app.put("/api/projects/{project_id}", response_model=ProjectRead)
+def put_project(project_id: int, payload: ProjectUpdatePUT, db: Session = Depends(get_db)):
+   proj = db.get(ProjectDB, project_id)
+   if not proj:
+       raise HTTPException(status_code=404, detail="Project not found")
+   if payload.owner_id != proj.owner_id:
+       owner = db.get(UserDB, payload.owner_id)
+       if not owner:
+           raise HTTPException(status_code=404, detail="Owner user not found")
+   proj.name = payload.name
+   proj.description = payload.description
+   proj.owner_id = payload.owner_id
+   commit_or_rollback(db, "Project update failed (conflict)")
+   db.refresh(proj)
+   return proj
+
+# --- Projects: PATCH (partial) ---
+@app.patch("/api/projects/{project_id}", response_model=ProjectRead)
+def patch_project(project_id: int, payload: ProjectUpdatePATCH, db: Session = Depends(get_db)):
+   proj = db.get(ProjectDB, project_id) # get existing project from DB
+   if not proj:
+       raise HTTPException(status_code=404, detail="Project not found")
+   data = payload.model_dump(exclude_unset=True)
+   if "owner_id" in data and data["owner_id"] is not None:
+       owner = db.get(UserDB, data["owner_id"])
+       if not owner:
+           raise HTTPException(status_code=404, detail="Owner user not found")
+   for k, v in data.items():
+       setattr(proj, k, v)
+   commit_or_rollback(db, "Project update failed (conflict)")
+   db.refresh(proj)
+   return proj
+
+#Nested route: Get all projects for a specific user
+@app.get("/api/users/{user_id}/projects", response_model=list[ProjectRead])
+def get_user_projects(user_id: int, db: Session = Depends(get_db)):
+    stmt = select(ProjectDB).where(ProjectDB.owner_id == user_id)
+    #space it out for debugging
+    result = db.execute(stmt)
+    rows = result.scalars().all()
+    return rows
+    #return db.execute(stmt).scalars().all()
+
+@app.post("/api/users/{user_id}/projects", response_model=ProjectRead, status_code=201)
+def create_user_project(user_id: int, project: ProjectCreateForUser, db: Session =
+Depends(get_db)):
+    user = db.get(UserDB, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    proj = ProjectDB(
+        name=project.name,
+        description=project.description, # <-- set it
+        owner_id=user_id
+    )
+    db.add(proj)
+    commit_or_rollback(db, "Project creation failed")
+    db.refresh(proj)
+    return proj
+
+@app.get("/api/users", response_model=list[UserRead])
+def list_users(db: Session = Depends(get_db)):
+    stmt = select(UserDB).order_by(UserDB.id)
+    #Useful for debugging
+    result = db.execute(stmt)
+    users = result.scalars().all()
+    return users
+    #return list(db.execute(stmt).scalars())
+
+@app.get("/api/users/{user_id}", response_model=UserRead)
+def get_user(user_id: int, db: Session = Depends(get_db)):
+    user = db.get(UserDB, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+@app.post("/api/users", response_model=UserRead, status_code=status.HTTP_201_CREATED)
+def add_user(payload: UserCreate, db: Session = Depends(get_db)):
+    user = UserDB(**payload.model_dump())
+    db.add(user)
+    commit_or_rollback(db, "User already exists")
+    db.refresh(user)
+    return user
+
+# DELETE a user (triggers ORM cascade -> deletes their projects too)
+@app.delete("/api/users/{user_id}", status_code=204)
+def delete_user(user_id: int, db: Session = Depends(get_db)) -> Response: 
+    user = db.get(UserDB, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    db.delete(user) # <-- triggers cascade="all, delete-orphan" on projects
     db.commit()
-    return
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+# --- Users: PUT (full replace) ---
+@app.put("/api/users/{user_id}", response_model=UserRead)
+def put_user(user_id: int, payload: UserUpdatePUT, db: Session = Depends(get_db)):
+   user = db.get(UserDB, user_id)
+   if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+   user.name = payload.name
+   user.email = payload.email
+   user.age = payload.age
+   user.student_id = payload.student_id
+   commit_or_rollback(db, "User update failed (conflict)")
+   db.refresh(user)
+   return user
+
+# --- Users: PATCH (partial) ---
+@app.patch("/api/users/{user_id}", response_model=UserRead)
+def patch_user(user_id: int, payload: UserUpdatePATCH, db: Session = Depends(get_db)):
+   user = db.get(UserDB, user_id)
+   if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+   data = payload.model_dump(exclude_unset=True)
+   for k, v in data.items():
+       setattr(user, k, v)
+   commit_or_rollback(db, "User update failed (conflict)")
+   db.refresh(user)
+   return user
+
